@@ -1,0 +1,306 @@
+```{r}
+# ================================================
+# GRAFICOS METAR MRPV (2020–2025)
+# ================================================
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(openxlsx)
+library(tidyr)
+
+# --- 1. Leer datos desde tu carpeta principal ---
+base_path <- "C:/Users/50689/Desktop/pavas"
+files <- list.files(base_path, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE)
+
+# --- 2. Unir todos los datos METAR ---
+df <- tibble(file = files) %>%
+  mutate(content = lapply(file, read_lines)) %>%
+  unnest(content) %>%
+  filter(str_detect(content, "METAR MRPV")) %>%
+  mutate(
+    year = as.numeric(str_extract(file, "(20\\d{2})")),
+    month = as.numeric(str_extract(file, "(?<=-)\\d{2}")),
+    raw_date = str_extract(content, "\\d{6}Z"),
+    dia = as.numeric(substr(raw_date, 1, 2)),
+    hora = as.numeric(substr(raw_date, 3, 4)),
+    fecha = suppressWarnings(make_datetime(year, month, dia, hora, tz = "UTC")),
+    vis_m = as.numeric(str_extract(content, "(?<= )\\d{4}(?= )")),
+    nubes = str_extract_all(content, "(FEW|SCT|BKN|OVC)\\d{3}", simplify = TRUE),
+    techo_ft = apply(nubes, 1, function(x) {
+      vals <- as.numeric(str_extract(x[x != ""], "\\d{3}"))
+      if (length(vals) == 0) return(9999)
+      return(min(vals) * 100)
+    })
+  ) %>%
+  filter(!is.na(year), !is.na(fecha))
+
+# --- 3. Clasificación VFR/MVFR/IFR/LIFR ---
+df <- df %>%
+  mutate(
+    categoria = case_when(
+      vis_m >= 8000 & techo_ft > 3000 ~ "VFR",
+      vis_m >= 4800 & vis_m < 8000 & techo_ft >= 1000 & techo_ft <= 3000 ~ "MVFR",
+      vis_m >= 1600 & vis_m < 4800 & techo_ft >= 500 & techo_ft < 1000 ~ "IFR",
+      vis_m < 1600 | techo_ft < 500 ~ "LIFR",
+      TRUE ~ "DESCONOCIDO"
+    )
+  )
+
+# --- 4. Porcentajes por mes y año ---
+resumen_mes <- df %>%
+  group_by(year, month, categoria) %>%
+  summarise(conteo = n(), .groups = "drop_last") %>%
+  mutate(pct = 100 * conteo / sum(conteo))
+
+# --- 5. Gráfico comparativo mensual ---
+ggplot(resumen_mes, aes(x = month, y = pct, color = categoria, group = categoria)) +
+  geom_point(size = 2) +
+  geom_line() +
+  facet_wrap(~year, ncol = 3) +
+  labs(
+    title = "Condiciones de vuelo MRPV (2020–2025)",
+    subtitle = "Porcentaje mensual por categoría de vuelo",
+    x = "Mes",
+    y = "Porcentaje (%)",
+    color = "Categoría"
+  ) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = c("Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic")
+  ) +
+  scale_color_manual(values = c(
+    "VFR" = "#27AE60",
+    "MVFR" = "#F1C40F",
+    "IFR" = "#E67E22",
+    "LIFR" = "#E74C3C"
+  )) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 10),
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "right"
+  )
+
+# --- 6. Evaluar cumplimiento de mínimos RTC ---
+rtc <- df %>%
+  mutate(rtc_ok = vis_m >= 1500 & techo_ft >= 500) %>%
+  group_by(year, month) %>%
+  summarise(
+    total = n(),
+    cumple = sum(rtc_ok, na.rm = TRUE),
+    pct_cumple = 100 * cumple / total
+  )
+
+# --- 7. Gráfico de cumplimiento RTC ---
+ggplot(rtc, aes(x = month, y = pct_cumple, group = year, color = factor(year))) +
+  geom_point(size = 2) +
+  geom_line() +
+  labs(
+    title = "Cumplimiento de mínimos RTC (VFR) - MRPV (2020–2025)",
+    x = "Mes",
+    y = "Porcentaje de observaciones que cumplen (%)",
+    color = "Año"
+  ) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  theme_minimal()
+
+```
+
+```{r}
+# =============================================================
+# SIMULADOR DE CONDICIONES DE VUELO - AEROPUERTO MRPV (Pavas)
+# =============================================================
+
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(tidyr)
+
+# === 1. Cargar base de datos local 
+base_path <- "C:/Users/50689/Desktop/pavas"
+files <- list.files(base_path, pattern = "\\.txt$", full.names = TRUE, recursive = TRUE)
+
+df <- tibble(file = files) %>%
+  mutate(content = lapply(file, read_lines)) %>%
+  unnest(content) %>%
+  filter(str_detect(content, "METAR MRPV"), !str_detect(content, "NIL")) %>%
+  mutate(
+    year  = as.numeric(str_extract(file, "(20\\d{2})")),
+    month = as.numeric(str_extract(file, "(?<=-)\\d{2}")),
+    raw_date = str_extract(content, "\\d{6}Z"),
+    dia   = as.numeric(substr(raw_date, 1, 2)),
+    hora  = as.numeric(substr(raw_date, 3, 4)),
+
+    # Visibilidad
+    vis_m = as.numeric(str_extract(content, "(?<= )\\d{4}(?= )")),
+
+    # Techo convertido a pies según la base más baja
+    techo_ft = apply(str_extract_all(content, "(FEW|SCT|BKN|OVC)\\d{3}", simplify = TRUE), 1,
+      function(x) {
+        vals <- as.numeric(str_extract(x[x != ""], "\\d{3}"))
+        if (length(vals) == 0) return(9999)
+        min(vals) * 100
+      })
+  ) %>%
+  filter(!is.na(vis_m), !is.na(techo_ft))
+
+# === 2. Clasificación FAA/RAG primaria
+df <- df %>%
+  mutate(
+    categoria = case_when(
+      vis_m >= 8000 & techo_ft > 3000 ~ "VFR",
+      vis_m >= 4800 & vis_m < 8000 & techo_ft >= 1000 & techo_ft <= 3000 ~ "MVFR",
+      vis_m >= 1600 & vis_m < 4800 & techo_ft >= 500 & techo_ft < 1000 ~ "IFR",
+      vis_m < 1600 | techo_ft < 500 ~ "LIFR",
+      TRUE ~ "DESCONOCIDO"
+    )
+  )
+
+# Penalización por fenómenos peligrosos
+df <- df %>%
+  mutate(
+    categoria = case_when(
+      str_detect(content, "TS|\\+RA|RA|SHRA|FG|BR|SN|FZRA|HZ") & categoria == "VFR"  ~ "MVFR",
+      str_detect(content, "TS|\\+RA|RA|SHRA|FG|BR|SN|FZRA|HZ") & categoria == "MVFR" ~ "IFR",
+      TRUE ~ categoria
+    )
+  )
+
+# === 3. Probabilidad estadística por hora (5 años)
+prob_hist <- df %>%
+  group_by(month, dia, hora, categoria) %>%
+  summarise(freq = n(), .groups = "drop") %>%
+  group_by(month, dia, hora) %>%
+  mutate(prob = round(100 * freq / sum(freq), 2)) %>%
+  ungroup()
+
+# === 4. Interfaz
+cat("\n===========================================")
+cat("\n  SIMULADOR DE CONDICIONES DE VUELO - MRPV")
+cat("\n===========================================\n")
+
+cat("\nCategorías posibles:")
+cat("\n - VFR  → Visual Flight Rules (visibilidad ≥ 8 km, techo > 3000 ft)")
+cat("\n - MVFR → Marginal Visual Flight Rules (visibilidad o techo reducidos)")
+cat("\n - IFR  → Instrument Flight Rules (visibilidad < 4800 m o techo < 1000 ft)")
+cat("\n - LIFR → Low IFR (visibilidad < 1600 m o techo < 500 ft)\n")
+
+mes  <- as.numeric(readline("\nIngrese el mes (1-12): "))
+dia  <- as.numeric(readline("Ingrese el día del mes (1-31): "))
+hora <- as.numeric(readline("Ingrese la hora Zulu (00-23): "))
+
+cat("\nAnalizando datos históricos...\n")
+
+# === 5. Promedio histórico del día y hora exacta
+hist_dia <- prob_hist %>%
+  filter(month == mes, dia == dia, hora == hora, categoria == "VFR") %>%
+  summarise(prom = mean(prob)) %>%
+  pull(prom)
+if (is.na(hist_dia)) hist_dia <- 0
+
+cat("\nResultados históricos para el", dia, "de", month.name[mes], "a las", hora, ":00Z\n")
+cat("\nEl día ingresado presenta condiciones promedio VFR de", round(hist_dia, 2), "%.\n")
+if (hist_dia >= 65) {
+  cat("Esto indica que el clima es favorable para vuelo visual, con buena visibilidad y pocas nubes bajas.\n")
+} else {
+  cat("Esto indica que las condiciones son marginales o poco favorables para vuelo visual.\n")
+}
+
+cat("\nRecomendación operacional estadística (5 años):\n")
+if (hist_dia >= 75) {
+  cat("Condiciones generalmente favorables para vuelo VFR.\n")
+} else if (hist_dia >= 50) {
+  cat("Vuelo VFR posible, pero se recomienda alterno planificado y monitoreo cercano.\n")
+} else if (hist_dia >= 30) {
+  cat("Operación VFR poco recomendable. Evaluar seriamente operación IFR o reprogramar.\n")
+} else {
+  cat("No recomendado para planificación VFR según tendencia histórica.\n")
+}
+
+# === 6. Análisis horario ±2h
+ventana_horas <- seq(hora - 2, hora + 2)
+sub_vent <- prob_hist %>%
+  filter(month == mes, dia == dia, hora %in% ventana_horas, categoria == "VFR") %>%
+  group_by(hora) %>%
+  summarise(prob = mean(prob), .groups = "drop") %>%
+  arrange(hora)
+
+cat("\n--- Análisis horario del día seleccionado (±2h) ---\n")
+if (nrow(sub_vent) == 0) {
+  cat("  Sin datos históricos suficientes\n")
+} else {
+  for (i in 1:nrow(sub_vent)) {
+    cat(sprintf("  • %02d:00Z → %.2f%% VFR\n", sub_vent$hora[i], sub_vent$prob[i]))
+  }
+}
+
+# Recomendación dentro del mismo día
+if (nrow(sub_vent) > 0) {
+  mejor_h <- sub_vent %>% slice_max(prob, n = 1)
+  cat("\nRecomendación: dentro de este mismo día, las mejores condiciones VFR se observan alrededor de las",
+      sprintf("%02d:00Z", mejor_h$hora),
+      "con una probabilidad de", round(mejor_h$prob, 2), "%.\n")
+} else {
+  cat("\nRecomendación: no es posible estimar una ventana óptima de vuelo visual para este día debido a insuficiencia de datos.\n")
+}
+
+# === 7. Búsqueda estadística de días anteriores/posteriores favorables (≥65% VFR)
+dia_anterior <- prob_hist %>%
+  filter(categoria == "VFR", (month < mes | (month == mes & dia < dia))) %>%
+  group_by(month, dia) %>%
+  summarise(prom = mean(prob), .groups = "drop") %>%
+  filter(prom >= 65) %>%
+  arrange(desc(month), desc(dia)) %>%
+  slice_head(n = 1)
+
+dia_posterior <- prob_hist %>%
+  filter(categoria == "VFR", (month > mes | (month == mes & dia > dia))) %>%
+  group_by(month, dia) %>%
+  summarise(prom = mean(prob), .groups = "drop") %>%
+  filter(prom >= 65) %>%
+  arrange(month, dia) %>%
+  slice_head(n = 1)
+
+# --- Día anterior
+if (nrow(dia_anterior) > 0) {
+  cat("\n--- Día anterior más cercano con buenas condiciones ---\n")
+  cat("El", dia_anterior$dia, "de", month.name[dia_anterior$month],
+      "mostró un promedio de VFR del", round(dia_anterior$prom, 2), "%.\n")
+} else {
+  cat("\n--- Día anterior más cercano con buenas condiciones ---\n")
+  cat("No se encontró ningún día anterior con condiciones VFR favorables dentro del rango estadístico.\n")
+}
+
+# --- Día posterior
+if (nrow(dia_posterior) > 0) {
+  cat("\n--- Día posterior más cercano con buenas condiciones ---\n")
+  cat("El", dia_posterior$dia, "de", month.name[dia_posterior$month],
+      "mostró un promedio de VFR del", round(dia_posterior$prom, 2), "%.\n")
+} else {
+  cat("\n--- Día posterior más cercano con buenas condiciones ---\n")
+  cat("No se encontró ningún día posterior con condiciones VFR favorables dentro del rango estadístico.\n")
+}
+
+# === 8. Interpretación final (siempre visible)
+cat("\n--- Interpretación meteorológica ---\n")
+cat("En general, los meses con alta proporción VFR presentan estabilidad atmosférica,\n")
+cat("nubes altas y buena visibilidad. En MRPV las mejores ventanas suelen ocurrir entre 16Z y 19Z.\n")
+
+cat("\nSimulación finalizada.\n")
+
+
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,3 @@
+Status: 501 Sorry, your quota limit for slow queries rate (a query per remote IP every 20 seconds) has been reached
+
+
